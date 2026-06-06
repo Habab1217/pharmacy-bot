@@ -854,11 +854,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # ── entry point ───────────────────────────────────────────────────
 
-def main() -> None:
-    # Start health check server in background thread
-    t = threading.Thread(target=run_health_server, daemon=True)
-    t.start()
-
+async def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set")
@@ -876,8 +872,16 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     logger.info("Bot is starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    async with app:
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        threading.Thread(target=run_health_server, daemon=True).start()
+        # Run forever
+        await asyncio.Event().wait()
+        await app.updater.stop()
+        await app.stop()
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
