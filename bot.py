@@ -78,8 +78,6 @@ def main_menu_keyboard(lang: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(t("btn_rating", lang), callback_data="rate_pharmacy")],
         [InlineKeyboardButton(t("btn_loyalty", lang), callback_data="loyalty_points")],
         [InlineKeyboardButton(t("btn_tax_report", lang), callback_data="tax_report")],
-        [InlineKeyboardButton(t("btn_medlink_score", lang), callback_data="medlink_score")],
-        [InlineKeyboardButton(t("btn_community_report", lang), callback_data="community_report")],
         [InlineKeyboardButton(t("btn_help", lang), callback_data="help")],
         [InlineKeyboardButton(t("btn_language", lang), callback_data="change_language")],
     ])
@@ -163,259 +161,6 @@ def format_ratings_summary() -> str:
         lines.append(f"   📊 _(avg {avg:.1f}/5 · {len(stars_list)} ግምገማዎች)_\n")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     return "\n".join(lines)
-
-
-# ── MedLink Score engine ──────────────────────────────────────────
-
-def _read_ratings_per_pharmacy() -> dict:
-    """Returns {pharmacy_name: [stars, ...]}"""
-    import collections
-    result = collections.defaultdict(list)
-    log_path = os.path.join(os.path.dirname(__file__), "ratings.log")
-    if not os.path.exists(log_path):
-        return result
-    with open(log_path, encoding="utf-8") as f:
-        for line in f:
-            try:
-                parts = {p.split("=", 1)[0].strip(): p.split("=", 1)[1].strip()
-                         for p in line.split("|")}
-                ph = parts.get("pharmacy", "").strip()
-                stars = int(parts.get("stars", "0").strip())
-                if ph and stars:
-                    result[ph].append(stars)
-            except Exception:
-                continue
-    return result
-
-
-def _read_community_reports_per_pharmacy() -> dict:
-    """Returns {pharmacy_name: report_count}"""
-    import collections
-    result = collections.defaultdict(int)
-    log_path = os.path.join(os.path.dirname(__file__), "community_reports.log")
-    if not os.path.exists(log_path):
-        return result
-    with open(log_path, encoding="utf-8") as f:
-        for line in f:
-            try:
-                parts = {p.split("=", 1)[0].strip(): p.split("=", 1)[1].strip()
-                         for p in line.split("|")}
-                ph = parts.get("pharmacy", "").strip()
-                if ph:
-                    result[ph] += 1
-            except Exception:
-                continue
-    return result
-
-
-def compute_medlink_score(pharmacy: dict, ratings: list, report_count: int) -> dict:
-    """
-    Compute MedLink Score (0–100) for one pharmacy.
-
-    Components:
-      A) Rating score     — 40 pts  (avg stars / 5 × 40)
-      B) Stock breadth    — 30 pts  (# medicines in stock / 30 × 30)
-      C) Community trust  — 20 pts  (100 − penalty per bad report, min 0)
-      D) Tier bonus       — 10 pts  (budget=10, standard=5, premium=2)
-    """
-    # A — rating
-    if ratings:
-        avg_stars = sum(ratings) / len(ratings)
-        rating_score = round((avg_stars / 5) * 40)
-    else:
-        rating_score = 20  # neutral default when no reviews yet
-
-    # B — stock breadth
-    stock_count = len(pharmacy.get("stock", {}))
-    stock_score = min(30, round((stock_count / 30) * 30))
-
-    # C — community trust (each report docks 5 pts)
-    community_score = max(0, 20 - report_count * 5)
-
-    # D — tier bonus
-    tier_bonus = {"budget": 10, "standard": 5, "premium": 2}.get(
-        pharmacy.get("tier", "standard"), 5
-    )
-
-    total = rating_score + stock_score + community_score + tier_bonus
-
-    # Grade
-    if total >= 85:
-        grade, badge = "A+", "🏅"
-    elif total >= 75:
-        grade, badge = "A", "🥇"
-    elif total >= 60:
-        grade, badge = "B", "🥈"
-    elif total >= 45:
-        grade, badge = "C", "🥉"
-    else:
-        grade, badge = "D", "⚠️"
-
-    return {
-        "total": total,
-        "grade": grade,
-        "badge": badge,
-        "rating_score": rating_score,
-        "stock_score": stock_score,
-        "community_score": community_score,
-        "tier_bonus": tier_bonus,
-        "review_count": len(ratings),
-        "avg_stars": round(sum(ratings) / len(ratings), 1) if ratings else None,
-    }
-
-
-def format_medlink_scoreboard() -> str:
-    """Build full MedLink Score leaderboard text."""
-    ratings_map = _read_ratings_per_pharmacy()
-    reports_map = _read_community_reports_per_pharmacy()
-
-    scored = []
-    for ph in PHARMACIES:
-        name = ph["name"]
-        sc = compute_medlink_score(ph, ratings_map.get(name, []), reports_map.get(name, 0))
-        scored.append((name, ph.get("name_en", name), sc))
-
-    scored.sort(key=lambda x: -x[2]["total"])
-
-    lines = [
-        "🏆 *MedLink Score — ደረጃ ሰሌዳ*",
-        "_የፋርማሲ አጠቃላይ ደረጃ / Overall Pharmacy Rankings_\n",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    ]
-    for rank, (name, name_en, sc) in enumerate(scored, 1):
-        stars_txt = f"⭐{sc['avg_stars']}/5" if sc["avg_stars"] else "⭐—"
-        lines.append(
-            f"{rank}. {sc['badge']} *{name}* (`{sc['grade']}` · {sc['total']}/100)\n"
-            f"   {stars_txt} · 📦{sc['stock_score']}pt · 🤝{sc['community_score']}pt"
-        )
-    lines.append("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append(
-        "_Score = Rating(40) + Stock(30) + Community Trust(20) + Tier(10)_"
-    )
-    return "\n".join(lines)
-
-
-def format_pharmacy_scorecard(idx: int) -> str:
-    """Detailed scorecard for one pharmacy."""
-    ph = PHARMACIES[idx]
-    name = ph["name"]
-    ratings_map = _read_ratings_per_pharmacy()
-    reports_map = _read_community_reports_per_pharmacy()
-    sc = compute_medlink_score(ph, ratings_map.get(name, []), reports_map.get(name, 0))
-
-    bar_filled = round(sc["total"] / 10)
-    bar = "█" * bar_filled + "░" * (10 - bar_filled)
-
-    avg_txt = f"{sc['avg_stars']}/5 ({sc['review_count']} ግምገማ)" if sc["avg_stars"] else "ምንም ግምገማ የለም"
-
-    return (
-        f"{sc['badge']} *{name}* — MedLink Score\n\n"
-        f"`{bar}` *{sc['total']}/100* · Grade: *{sc['grade']}*\n\n"
-        f"📊 *ዝርዝር / Breakdown:*\n"
-        f"  ⭐ Rating score:    *{sc['rating_score']}/40*  ({avg_txt})\n"
-        f"  📦 Stock score:     *{sc['stock_score']}/30*\n"
-        f"  🤝 Community trust: *{sc['community_score']}/20*\n"
-        f"  🏷️ Tier bonus:      *{sc['tier_bonus']}/10*\n\n"
-        f"📍 {ph.get('address','—')}\n"
-        f"📞 {ph.get('phone','—')}\n"
-        f"🕐 {ph.get('hours','—')}"
-    )
-
-
-# ── Community Reporting helpers ───────────────────────────────────
-
-def save_community_report(user_info: str, pharmacy_name: str, issue: str, detail: str) -> None:
-    import datetime
-    log_path = os.path.join(os.path.dirname(__file__), "community_reports.log")
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write(
-            f"[{ts}] user={user_info} | pharmacy={pharmacy_name} "
-            f"| issue={issue} | detail={detail}\n"
-        )
-
-
-def format_community_alerts() -> str:
-    """Show top-reported pharmacies as community alerts."""
-    import collections
-    log_path = os.path.join(os.path.dirname(__file__), "community_reports.log")
-    if not os.path.exists(log_path):
-        return (
-            "🚨 *Community Alerts*\n\n"
-            "_ምንም ሪፖርት አልተደረገም — No reports yet._"
-        )
-    counts = collections.Counter()
-    issues = collections.defaultdict(list)
-    with open(log_path, encoding="utf-8") as f:
-        for line in f:
-            try:
-                parts = {p.split("=", 1)[0].strip(): p.split("=", 1)[1].strip()
-                         for p in line.split("|")}
-                ph = parts.get("pharmacy", "").strip()
-                iss = parts.get("issue", "").strip()
-                if ph:
-                    counts[ph] += 1
-                    if iss and iss not in issues[ph]:
-                        issues[ph].append(iss)
-            except Exception:
-                continue
-
-    if not counts:
-        return (
-            "🚨 *Community Alerts*\n\n"
-            "_ምንም ሪፖርት አልተደረገም — No reports yet._"
-        )
-
-    lines = [
-        "🚨 *Community Alerts — የማህበረሰብ ሪፖርቶች*\n",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-    ]
-    for ph, count in counts.most_common(10):
-        issue_list = ", ".join(issues[ph][:3])
-        warn = "🔴" if count >= 5 else "🟡" if count >= 2 else "🟢"
-        lines.append(f"{warn} *{ph}* — {count} ሪፖርት\n   _{issue_list}_")
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("_ሪፖርቶች ለ MedLink Score ውስጥ ይወሰዳሉ_")
-    return "\n".join(lines)
-
-
-# ── async save helpers ────────────────────────────────────────────
-
-async def _save_community_report(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    detail: str,
-) -> None:
-    lang = get_lang(context)
-    data = context.user_data.get("community_data", {})
-    pharmacy = data.get("pharmacy", "—")
-    issue = data.get("issue", "—")
-    user = update.effective_user
-    user_info = f"@{user.username}" if user.username else str(user.id)
-
-    save_community_report(user_info, pharmacy, issue, detail)
-
-    context.user_data["mode"] = None
-    context.user_data.pop("community_step", None)
-    context.user_data.pop("community_data", None)
-
-    await update.effective_message.reply_text(
-        with_footer(
-            f"✅ *ሪፖርትዎ ደርሷል! / Report Submitted!*\n\n"
-            f"🏥 *{pharmacy}*\n"
-            f"⚠️ _{issue}_\n"
-            f"💬 _{detail}_\n\n"
-            f"ሪፖርቱ ለ MedLink Score ይወሰዳል።\n"
-            f"_This report will affect the pharmacy's MedLink Score._\n\n"
-            f"ለዚህ ትብብር እናመሰግናለን! 🙏"
-        ),
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🚨 Community Alerts", callback_data="community_alerts")],
-            [InlineKeyboardButton("🏆 MedLink Score", callback_data="medlink_score")],
-            [InlineKeyboardButton(t("btn_main_menu", lang), callback_data="back_to_menu")],
-        ]),
-    )
 
 
 async def _save_rating(
@@ -706,7 +451,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["mode"] = "prescription"
         await query.edit_message_text(
             with_footer(t("prescription_prompt", lang)), parse_mode="Markdown",
-            reply_markup=back_keyboard(lang),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📸 ፎቶ አንሳ / Scan Photo", callback_data="scan_photo_tip")],
+                [InlineKeyboardButton(t("btn_back", lang), callback_data="back_to_menu")],
+            ]),
+        )
+
+    elif query.data == "scan_photo_tip":
+        await query.answer(
+            "📱 ካሜራዎን ከፍቶ ፎቶ አንስተው ቀጥታ ይላኩ!\n"
+            "Open your camera, take a photo and send it here.",
+            show_alert=True,
         )
 
     elif query.data == "search_medicine":
@@ -912,141 +667,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             reply_markup=back_keyboard(lang),
         )
 
-    elif query.data == "medlink_score":
-        context.user_data["mode"] = None
-        text = format_medlink_scoreboard()
-        rows = []
-        pair = []
-        for i, ph in enumerate(PHARMACIES):
-            pair.append(InlineKeyboardButton(ph["name"], callback_data=f"scorecard_{i}"))
-            if len(pair) == 2:
-                rows.append(pair)
-                pair = []
-        if pair:
-            rows.append(pair)
-        rows.append([InlineKeyboardButton(t("btn_back", lang), callback_data="back_to_menu")])
-        await query.edit_message_text(
-            with_footer(text),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
-
-    elif query.data.startswith("scorecard_"):
-        idx = int(query.data.split("_")[-1])
-        text = format_pharmacy_scorecard(idx)
-        await query.edit_message_text(
-            with_footer(text),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🏆 ሁሉም ደረጃዎች (Scoreboard)", callback_data="medlink_score")],
-                [InlineKeyboardButton(t("btn_back", lang), callback_data="back_to_menu")],
-            ]),
-        )
-
-    elif query.data == "community_report":
-        context.user_data["mode"] = None
-        await query.edit_message_text(
-            with_footer(
-                "🚨 *Community Reporting — ማህበረሰብ ሪፖርት*\n\n"
-                "ምን ማድረግ ትፈልጋለህ?\n"
-                "_What would you like to do?_"
-            ),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 ፋርማሲ ሪፖርት አድርግ (Report Issue)", callback_data="community_report_new")],
-                [InlineKeyboardButton("📋 የሪፖርት ዝርዝር (View Alerts)", callback_data="community_alerts")],
-                [InlineKeyboardButton(t("btn_back", lang), callback_data="back_to_menu")],
-            ]),
-        )
-
-    elif query.data == "community_report_new":
-        context.user_data["mode"] = "community_report"
-        context.user_data["community_step"] = "pharmacy"
-        context.user_data["community_data"] = {}
-        rows = []
-        pair = []
-        for i, ph in enumerate(PHARMACIES):
-            pair.append(InlineKeyboardButton(ph["name"], callback_data=f"creport_pharm_{i}"))
-            if len(pair) == 2:
-                rows.append(pair)
-                pair = []
-        if pair:
-            rows.append(pair)
-        rows.append([InlineKeyboardButton(t("btn_back", lang), callback_data="community_report")])
-        await query.edit_message_text(
-            with_footer(
-                "📢 *ፋርማሲ ሪፖርት — ደረጃ 1/3*\n\n"
-                "ሪፖርት ማድረግ የሚፈልጉትን ፋርማሲ ይምረጡ:\n"
-                "_Select the pharmacy to report:_"
-            ),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(rows),
-        )
-
-    elif query.data.startswith("creport_pharm_"):
-        idx = int(query.data.split("_")[-1])
-        context.user_data["community_data"]["pharmacy"] = PHARMACIES[idx]["name"]
-        context.user_data["community_data"]["pharmacy_idx"] = idx
-        context.user_data["community_step"] = "issue"
-        await query.edit_message_text(
-            with_footer(
-                f"📢 *ፋርማሲ ሪፖርት — ደረጃ 2/3*\n\n"
-                f"🏥 _{PHARMACIES[idx]['name']}_\n\n"
-                f"ምን አይነት ችግር ይዟል?\n"
-                f"_What issue are you reporting?_"
-            ),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💰 ከፍተኛ ዋጋ (Overpricing)", callback_data="creport_issue_overpricing")],
-                [InlineKeyboardButton("❌ ምርት የለም (Out of Stock)", callback_data="creport_issue_stockout")],
-                [InlineKeyboardButton("📋 ሐሰተኛ ደረሰኝ (Fake Receipt)", callback_data="creport_issue_fake_receipt")],
-                [InlineKeyboardButton("🪪 ፈቃድ የለም (No License)", callback_data="creport_issue_no_license")],
-                [InlineKeyboardButton("😤 ደካማ አገልግሎት (Poor Service)", callback_data="creport_issue_poor_service")],
-                [InlineKeyboardButton(t("btn_back", lang), callback_data="community_report_new")],
-            ]),
-        )
-
-    elif query.data.startswith("creport_issue_"):
-        issue_key = query.data.replace("creport_issue_", "")
-        issue_labels = {
-            "overpricing": "💰 ከፍተኛ ዋጋ",
-            "stockout": "❌ ምርት የለም",
-            "fake_receipt": "📋 ሐሰተኛ ደረሰኝ",
-            "no_license": "🪪 ፈቃድ የለም",
-            "poor_service": "😤 ደካማ አገልግሎት",
-        }
-        context.user_data["community_data"]["issue"] = issue_labels.get(issue_key, issue_key)
-        context.user_data["community_step"] = "detail"
-        pharmacy = context.user_data["community_data"].get("pharmacy", "")
-        await query.edit_message_text(
-            with_footer(
-                f"📢 *ፋርማሲ ሪፖርት — ደረጃ 3/3*\n\n"
-                f"🏥 _{pharmacy}_\n"
-                f"⚠️ _{issue_labels.get(issue_key, issue_key)}_\n\n"
-                f"ተጨማሪ ዝርዝር ጻፉ (ወይም /skip ይጻፉ):\n"
-                f"_Add more detail (or type /skip):_"
-            ),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("⏭️ ዝለል (Skip)", callback_data="creport_skip_detail")],
-                [InlineKeyboardButton(t("btn_back", lang), callback_data="community_report_new")],
-            ]),
-        )
-
-    elif query.data == "creport_skip_detail":
-        await _save_community_report(update, context, detail="—")
-
-    elif query.data == "community_alerts":
-        text = format_community_alerts()
-        await query.edit_message_text(
-            with_footer(text),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 ሪፖርት አድርግ (Report)", callback_data="community_report_new")],
-                [InlineKeyboardButton(t("btn_back", lang), callback_data="back_to_menu")],
-            ]),
-        )
-
 
 # ── location handler ──────────────────────────────────────────────
 
@@ -1158,14 +778,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             # User typed a comment (or /skip)
             comment = "—" if text.lower() in ("/skip", "skip") else text
             await _save_rating(update, context, comment=comment)
-            return
-
-    if context.user_data.get("mode") == "community_report":
-        step = context.user_data.get("community_step")
-
-        if step == "detail":
-            detail = "—" if text.lower() in ("/skip", "skip") else text
-            await _save_community_report(update, context, detail=detail)
             return
 
     if context.user_data.get("mode") == "report":
