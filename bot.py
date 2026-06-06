@@ -17,8 +17,6 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
     server.serve_forever()
 
-threading.Thread(target=run_health_server, daemon=True).start()
-
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -856,7 +854,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 # ── entry point ───────────────────────────────────────────────────
 
-async def main() -> None:
+def main() -> None:
+    # Start health check server in background thread
+    t = threading.Thread(target=run_health_server, daemon=True)
+    t.start()
+
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN environment variable is not set")
@@ -874,9 +876,8 @@ async def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     logger.info("Bot is starting...")
-    await app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
