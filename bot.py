@@ -449,19 +449,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif query.data == "send_prescription":
         context.user_data["mode"] = "prescription"
+        # Send a NEW message with ReplyKeyboard so camera button appears at bottom
         await query.edit_message_text(
-            with_footer(t("prescription_prompt", lang)), parse_mode="Markdown",
+            with_footer(t("prescription_prompt", lang)),
+            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📸 ፎቶ አንሳ / Scan Photo", callback_data="scan_photo_tip")],
                 [InlineKeyboardButton(t("btn_back", lang), callback_data="back_to_menu")],
             ]),
         )
-
-    elif query.data == "scan_photo_tip":
-        await query.answer(
-            "📱 ካሜራዎን ከፍቶ ፎቶ አንስተው ቀጥታ ይላኩ!\n"
-            "Open your camera, take a photo and send it here.",
-            show_alert=True,
+        # ReplyKeyboard with request_photo — opens camera/gallery on tap
+        await query.message.reply_text(
+            "👇 ከታች ያለውን ቁልፍ ተጫን:\n_Tap the button below to open your camera:_",
+            reply_markup=ReplyKeyboardMarkup(
+                [[KeyboardButton("📸 ፎቶ አንሳ / Take Photo", request_photo=True)]],
+                resize_keyboard=True,
+                one_time_keyboard=True,
+            ),
         )
 
     elif query.data == "search_medicine":
@@ -553,6 +556,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data.pop("report_data", None)
         context.user_data.pop("rating_step", None)
         context.user_data.pop("rating_data", None)
+        # Remove any ReplyKeyboard (e.g. camera button from prescription)
+        await query.message.reply_text("↩️", reply_markup=ReplyKeyboardRemove())
         await query.edit_message_text(
             with_footer(t("welcome", lang)), parse_mode="Markdown",
             reply_markup=main_menu_keyboard(lang),
@@ -720,6 +725,12 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     context.user_data["mode"] = None
+    # Remove the camera ReplyKeyboard immediately
+    await update.message.reply_text(
+        "⏳ *ማዘዣው እየተነተነ ነው...*\n_Analyzing your prescription..._",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     processing_msg = await update.message.reply_text(
         t("analyzing", lang), parse_mode="Markdown",
     )
