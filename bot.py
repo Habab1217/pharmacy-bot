@@ -449,22 +449,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     elif query.data == "send_prescription":
         context.user_data["mode"] = "prescription"
-        # Send a NEW message with ReplyKeyboard so camera button appears at bottom
         await query.edit_message_text(
-            with_footer(t("prescription_prompt", lang)),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton(t("btn_back", lang), callback_data="back_to_menu")],
-            ]),
-        )
-        # ReplyKeyboard with request_photo — opens camera/gallery on tap
-        await query.message.reply_text(
-            "👇 ከታች ያለውን ቁልፍ ተጫን:\n_Tap the button below to open your camera:_",
-            reply_markup=ReplyKeyboardMarkup(
-                [[KeyboardButton("📸 ፎቶ አንሳ / Take Photo", request_photo=True)]],
-                resize_keyboard=True,
-                one_time_keyboard=True,
-            ),
+            with_footer(t("prescription_prompt", lang)), parse_mode="Markdown",
+            reply_markup=back_keyboard(lang),
         )
 
     elif query.data == "search_medicine":
@@ -556,8 +543,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data.pop("report_data", None)
         context.user_data.pop("rating_step", None)
         context.user_data.pop("rating_data", None)
-        # Remove any ReplyKeyboard (e.g. camera button from prescription)
-        await query.message.reply_text("↩️", reply_markup=ReplyKeyboardRemove())
         await query.edit_message_text(
             with_footer(t("welcome", lang)), parse_mode="Markdown",
             reply_markup=main_menu_keyboard(lang),
@@ -725,12 +710,6 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     context.user_data["mode"] = None
-    # Remove the camera ReplyKeyboard immediately
-    await update.message.reply_text(
-        "⏳ *ማዘዣው እየተነተነ ነው...*\n_Analyzing your prescription..._",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove(),
-    )
     processing_msg = await update.message.reply_text(
         t("analyzing", lang), parse_mode="Markdown",
     )
@@ -758,10 +737,33 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     except Exception as e:
         logger.error(f"Error processing prescription photo: {e}")
-        await processing_msg.delete()
+        err_str = str(e)
+        # Show specific error hint
+        if "GEMINI_API_KEY" in err_str or "API_KEY" in err_str:
+            hint = "⚙️ _GEMINI_API_KEY አልተዋቀረም — Render environment variables ላይ ያስገቡ።_"
+        elif "quota" in err_str.lower() or "429" in err_str:
+            hint = "⏳ _Gemini API limit ደርሷል — ትንሽ ቆይቶ ይሞክሩ።_"
+        elif "invalid" in err_str.lower() or "image" in err_str.lower():
+            hint = "🖼️ _ፎቶው ሊነበብ አልቻለም — ፎቶውን በደንብ አንስቶ እንደገና ይሞክሩ።_"
+        else:
+            hint = f"🔧 _{err_str[:120]}_"
+        try:
+            await processing_msg.delete()
+        except Exception:
+            pass
+        context.user_data["mode"] = "prescription"  # allow retry
         await update.message.reply_text(
-            with_footer(t("photo_error", lang)), parse_mode="Markdown",
-            reply_markup=main_menu_keyboard(lang),
+            with_footer(
+                f"❌ *ስህተት ተፈጠረ / Error*\n\n"
+                f"{hint}\n\n"
+                f"እንደገና ፎቶ ላክ ወይም ወደ ዋናው ምናሌ ተመለስ።\n"
+                f"_Send the photo again or go back to main menu._"
+            ),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 እንደገና ሞክር (Retry)", callback_data="send_prescription")],
+                [InlineKeyboardButton(t("btn_main_menu", lang), callback_data="back_to_menu")],
+            ]),
         )
 
 

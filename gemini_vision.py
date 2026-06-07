@@ -1,64 +1,41 @@
 import os
 import google.generativeai as genai
-from pharmacies import MEDICINES
 
 
-def _fuzzy_match(extracted: list[str], known: list[str]) -> list[dict]:
-    """
-    Match extracted medicine names (possibly handwritten/misspelled)
-    against our registered MEDICINES list using simple scoring.
-    Returns list of {extracted, matched, score} sorted best-first.
-    """
+def _fuzzy_match(extracted: list, known: list) -> list:
+    """Match extracted names against registered MEDICINES list."""
     results = []
     for raw in extracted:
         raw_clean = raw.strip().lower()
         if not raw_clean:
             continue
-
         best_match = None
         best_score = 0
-
         for med in known:
             med_lower = med.lower()
-
-            # Exact match
             if raw_clean == med_lower:
                 score = 100
-            # Starts-with
             elif med_lower.startswith(raw_clean) or raw_clean.startswith(med_lower):
                 score = 85
-            # Substring
             elif raw_clean in med_lower or med_lower in raw_clean:
                 score = 70
-            # Character overlap ratio (simple bigram)
             else:
                 raw_set = set(raw_clean[i:i+2] for i in range(len(raw_clean)-1))
                 med_set = set(med_lower[i:i+2] for i in range(len(med_lower)-1))
                 if raw_set and med_set:
-                    overlap = len(raw_set & med_set) / max(len(raw_set), len(med_set))
-                    score = int(overlap * 60)
+                    score = int(len(raw_set & med_set) / max(len(raw_set), len(med_set)) * 60)
                 else:
                     score = 0
-
             if score > best_score:
                 best_score = score
                 best_match = med
-
         if best_match and best_score >= 30:
-            results.append({
-                "extracted": raw.strip(),
-                "matched": best_match,
-                "score": best_score,
-                "confidence": "✅ ተገኝቷል" if best_score >= 70 else "⚠️ ሊሆን ይችላል",
-            })
+            confidence = "✅" if best_score >= 70 else "⚠️"
+            results.append({"extracted": raw.strip(), "matched": best_match,
+                            "score": best_score, "confidence": confidence})
         else:
-            results.append({
-                "extracted": raw.strip(),
-                "matched": None,
-                "score": 0,
-                "confidence": "❌ አልተገኘም",
-            })
-
+            results.append({"extracted": raw.strip(), "matched": None,
+                            "score": 0, "confidence": "❌"})
     return results
 
 
@@ -68,83 +45,83 @@ def extract_medicines_from_image(image_bytes: bytes, mime_type: str = "image/jpe
         raise RuntimeError("GEMINI_API_KEY environment variable is not set")
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash")
 
-    medicines_list = ", ".join(MEDICINES)
+    # Import here to avoid circular import
+    try:
+        from pharmacies import MEDICINES
+    except ImportError:
+        MEDICINES = []
 
-    image_part = {
-        "mime_type": mime_type,
-        "data": image_bytes,
-    }
+    medicines_list = ", ".join(MEDICINES) if MEDICINES else "paracetamol, amoxicillin, ibuprofen"
+
+    image_part = {"mime_type": mime_type, "data": image_bytes}
 
     prompt = (
         "This is a medical prescription photo, possibly handwritten in Amharic or English.\n"
-        "Your task:\n"
-        "1. Extract ONLY the medicine/drug names written on this prescription.\n"
-        "2. List each medicine name on a separate line.\n"
-        "3. Do NOT include dosage, instructions, or doctor notes — names only.\n"
-        "4. If handwriting is unclear, make your best guess at the medicine name.\n"
-        "5. Output format: one medicine name per line, nothing else.\n"
-        "6. If this is not a prescription, reply with exactly: NOT_A_PRESCRIPTION\n\n"
-        f"Known medicines in our system for reference: {medicines_list}"
+        "Task: Extract ONLY the medicine/drug names written on this prescription.\n"
+        "Rules:\n"
+        "- List each medicine name on a separate line\n"
+        "- Do NOT include dosage, instructions, or doctor notes\n"
+        "- If handwriting is unclear, make your best guess\n"
+        "- Output format: one medicine name per line, nothing else\n"
+        "- If this is not a prescription, reply with exactly: NOT_A_PRESCRIPTION\n\n"
+        f"Known medicines for reference: {medicines_list}"
     )
 
-    response = model.generate_content([image_part, prompt])
-    raw_text = response.text.strip()
+    try:
+        response = model.generate_content([image_part, prompt])
+        raw_text = response.text.strip()
+    except Exception as e:
+        raise RuntimeError(f"Gemini API error: {e}")
 
-    # Not a prescription
     if "NOT_A_PRESCRIPTION" in raw_text.upper():
         return (
             "❌ *ይህ የሀኪም ማዘዣ አይደለም*\n"
             "_This does not appear to be a medical prescription._\n\n"
-            "እባክዎ ትክክለኛ ማዘዣ ፎቶ ያስገቡ።\n"
-            "_Please send a clear photo of a medical prescription._"
+            "እባክዎ ትክክለኛ ማዘዣ ፎቶ ያስገቡ።"
         )
 
-    # Parse extracted medicine names
     extracted_names = [
-        line.strip().lstrip("-•*123456789. ")
+        line.strip().lstrip("-•*123456789. ").rstrip(".,;:")
         for line in raw_text.splitlines()
-        if line.strip()
+        if line.strip() and len(line.strip()) > 1
     ]
 
     if not extracted_names:
         return (
             "⚠️ *ምንም መድሃኒት ስም ሊታወቅ አልቻለ*\n"
             "_No medicine names could be extracted._\n\n"
-            "ፎቶው ግልፅ ካልሆነ እንደገና ይሞክሩ።\n"
-            "_If the photo is unclear, please try again with better lighting._"
+            "ፎቶው ግልፅ ካልሆነ እንደገና ይሞክሩ።"
         )
 
-    # Fuzzy match against our MEDICINES list
-    matches = _fuzzy_match(extracted_names, MEDICINES)
+    matches = _fuzzy_match(extracted_names, MEDICINES) if MEDICINES else []
 
     lines = [
         "💊 *የሀኪም ማዘዣ ትንተና / Prescription Analysis*\n",
         "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
     ]
 
-    found_count = 0
-    not_found = []
+    if matches:
+        found = [m for m in matches if m["matched"]]
+        not_found = [m for m in matches if not m["matched"]]
 
-    for m in matches:
-        if m["matched"]:
-            found_count += 1
+        for m in found:
             lines.append(
                 f"{m['confidence']} *{m['matched']}*\n"
                 f"   _ከማዘዣ: \"{m['extracted']}\"_"
             )
-        else:
-            not_found.append(m["extracted"])
 
-    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📊 {found_count}/{len(matches)} ምርቶች በስርዓቱ ውስጥ ተገኝተዋል")
-    lines.append(f"_{found_count}/{len(matches)} medicines found in our system_")
+        lines.append(f"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        lines.append(f"📊 *{len(found)}/{len(matches)}* ምርቶች ተገኝተዋል / found in system")
 
-    if not_found:
-        lines.append(
-            f"\n⚠️ *ያልተገኙ:* {', '.join(not_found)}\n"
-            "_Not registered in our pharmacy network_"
-        )
+        if not_found:
+            nf_names = ", ".join(m["extracted"] for m in not_found)
+            lines.append(f"\n⚠️ *ያልተገኙ:* _{nf_names}_")
+    else:
+        # No MEDICINES list — just show raw extracted names
+        lines.append("📋 *የተዘረዘሩ ስሞች:*")
+        for name in extracted_names:
+            lines.append(f"• {name}")
 
     return "\n".join(lines)
