@@ -1,3 +1,9 @@
+# Telegram bot framework
 python-telegram-bot==21.6
-google-generativeai==0.8.3
-httpx==0.27.2
+
+# QR code reading via OpenCV (headless = no GUI dependencies)
+opencv-python-headless>=4.8.0
+numpy>=1.24.0
+
+# Google Gemini Vision API
+google-generativeai>=0.8.0
