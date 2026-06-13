@@ -2,7 +2,335 @@ import logging
 import os
 import datetime
 import threading
+import hashlib
+import sqlite3
+import numpy as np
+import cv2
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+# ── SQLite DB for receipt tracking ───────────────────────────────
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts.db")
+
+def init_db():
+    """Create all required tables if they do not exist."""
+    conn = sqlite3.connect(DB_PATH)
+
+    # ── Receipt deduplication ─────────────────────────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS scanned_receipts (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            receipt_hash TEXT UNIQUE NOT NULL,
+            qr_data      TEXT NOT NULL,
+            user_id      TEXT NOT NULL,
+            scanned_at   TEXT NOT NULL
+        )
+    """)
+
+    # ── Monthly tax reports submitted by pharmacies ───────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tax_reports (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            pharmacy_name   TEXT NOT NULL,
+            user_id         TEXT NOT NULL,
+            report_month    TEXT NOT NULL,        -- e.g. '2024-06'
+            total_sales_birr REAL NOT NULL,
+            units_sold      INTEGER NOT NULL,
+            tax_paid_birr   REAL NOT NULL,
+            notes           TEXT,
+            submitted_at    TEXT NOT NULL,
+            status          TEXT DEFAULT 'pending' -- pending / approved / flagged
+        )
+    """)
+
+    # ── EFDA stock ledger (what was handed to each pharmacy) ──────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS efda_stock (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            pharmacy_name   TEXT NOT NULL,
+            medicine_name   TEXT NOT NULL,
+            units_allocated INTEGER NOT NULL,
+            allocated_month TEXT NOT NULL,        -- e.g. '2024-06'
+            recorded_at     TEXT NOT NULL
+        )
+    """)
+
+    # ── Rate limiting ─────────────────────────────────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS rate_limits (
+            user_id    TEXT NOT NULL,
+            action     TEXT NOT NULL,
+            ts         TEXT NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rl ON rate_limits(user_id, action, ts)")
+
+    conn.commit()
+    conn.close()
+
+def is_duplicate_receipt(receipt_hash: str) -> bool:
+    """Return True if this receipt hash was already scanned before."""
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT id FROM scanned_receipts WHERE receipt_hash = ?", (receipt_hash,)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+def save_receipt(receipt_hash: str, qr_data: str, user_id: str) -> None:
+    """Save a newly scanned receipt to the DB."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO scanned_receipts (receipt_hash, qr_data, user_id, scanned_at) "
+        "VALUES (?, ?, ?, ?)",
+        (receipt_hash, qr_data, str(user_id),
+         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.commit()
+    conn.close()
+
+def decode_qr_from_bytes(image_bytes: bytes) -> str | None:
+    """
+    Decode a QR code from raw image bytes using OpenCV.
+    Returns the QR string on success, or None if no valid QR is detected.
+    """
+    try:
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        detector = cv2.QRCodeDetector()
+        data, _, _ = detector.detectAndDecode(img)
+        if data and data.strip():
+            return data.strip()
+        # Retry with grayscale for low-contrast images
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        data, _, _ = detector.detectAndDecode(gray)
+        return data.strip() if data and data.strip() else None
+    except Exception as e:
+        logger.warning(f"QR decode error: {e}")
+        return None
+
+def hash_image(image_bytes: bytes) -> str:
+    """SHA-256 hash of raw image bytes — used as the duplicate key."""
+    return hashlib.sha256(image_bytes).hexdigest()
+
+
+# ── Tax report helpers ────────────────────────────────────────────
+
+def save_tax_report(pharmacy_name: str, user_id: str, report_month: str,
+                    total_sales: float, units_sold: int, tax_paid: float,
+                    notes: str = "") -> int:
+    """Insert a tax report and return its new row id."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute(
+        """INSERT INTO tax_reports
+           (pharmacy_name, user_id, report_month, total_sales_birr,
+            units_sold, tax_paid_birr, notes, submitted_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (pharmacy_name, str(user_id), report_month, total_sales,
+         units_sold, tax_paid, notes,
+         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    new_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return new_id
+
+
+def get_tax_reports(pharmacy_name: str | None = None,
+                    month: str | None = None) -> list[dict]:
+    """Return tax reports, optionally filtered by pharmacy and/or month."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    query  = "SELECT * FROM tax_reports WHERE 1=1"
+    params: list = []
+    if pharmacy_name:
+        query += " AND pharmacy_name = ?"
+        params.append(pharmacy_name)
+    if month:
+        query += " AND report_month = ?"
+        params.append(month)
+    query += " ORDER BY submitted_at DESC"
+    rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+    conn.close()
+    return rows
+
+
+# ── Stock reconciliation helpers ──────────────────────────────────
+
+def add_efda_stock(pharmacy_name: str, medicine_name: str,
+                   units: int, month: str) -> None:
+    """Record units allocated by EFDA to a pharmacy for a given month."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """INSERT INTO efda_stock
+           (pharmacy_name, medicine_name, units_allocated, allocated_month, recorded_at)
+           VALUES (?,?,?,?,?)""",
+        (pharmacy_name, medicine_name, units, month,
+         datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+    )
+    conn.commit()
+    conn.close()
+
+
+def reconcile_stock(pharmacy_name: str, month: str) -> dict:
+    """
+    Compare EFDA allocation vs pharmacy-reported sales for a given month.
+    Returns a summary dict with allocated, reported, and discrepancy.
+    """
+    conn = sqlite3.connect(DB_PATH)
+
+    # Total units EFDA handed to this pharmacy this month
+    row = conn.execute(
+        """SELECT COALESCE(SUM(units_allocated), 0)
+           FROM efda_stock
+           WHERE pharmacy_name=? AND allocated_month=?""",
+        (pharmacy_name, month),
+    ).fetchone()
+    allocated = int(row[0]) if row else 0
+
+    # Total units pharmacy claimed to sell this month
+    row2 = conn.execute(
+        """SELECT COALESCE(SUM(units_sold), 0)
+           FROM tax_reports
+           WHERE pharmacy_name=? AND report_month=? AND status != 'flagged'""",
+        (pharmacy_name, month),
+    ).fetchone()
+    reported = int(row2[0]) if row2 else 0
+
+    conn.close()
+    diff = reported - allocated          # positive → over-reported (fraud risk)
+    pct  = round((diff / allocated * 100) if allocated else 0, 1)
+    return {
+        "pharmacy":  pharmacy_name,
+        "month":     month,
+        "allocated": allocated,
+        "reported":  reported,
+        "diff":      diff,
+        "pct":       pct,
+        "flag":      diff > 0 or pct > 10,   # flag if reported > allocated or >10% gap
+    }
+
+
+def flag_tax_report(report_id: int) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE tax_reports SET status='flagged' WHERE id=?", (report_id,))
+    conn.commit()
+    conn.close()
+
+
+# ── Rate limiting ─────────────────────────────────────────────────
+# Limits per action (window_seconds, max_calls)
+RATE_LIMITS: dict[str, tuple[int, int]] = {
+    "qr_scan":     (3600, 10),   # max 10 QR scans per hour
+    "report_price":(3600, 20),   # max 20 price reports per hour
+    "rate_pharmacy":(86400, 5),  # max 5 ratings per day
+    "tax_report":  (86400, 3),   # max 3 tax reports per day
+    "search":      (60, 15),     # max 15 searches per minute
+}
+
+def check_rate_limit(user_id: str, action: str) -> tuple[bool, int]:
+    """
+    Returns (allowed: bool, remaining_seconds: int).
+    Cleans up old entries and checks whether the user is within limit.
+    """
+    window_s, max_calls = RATE_LIMITS.get(action, (60, 30))
+    now     = datetime.datetime.now()
+    cutoff  = (now - datetime.timedelta(seconds=window_s)).strftime("%Y-%m-%d %H:%M:%S")
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    conn = sqlite3.connect(DB_PATH)
+    # Purge old entries for this user+action
+    conn.execute(
+        "DELETE FROM rate_limits WHERE user_id=? AND action=? AND ts < ?",
+        (user_id, action, cutoff),
+    )
+    # Count recent calls
+    count = conn.execute(
+        "SELECT COUNT(*) FROM rate_limits WHERE user_id=? AND action=?",
+        (user_id, action),
+    ).fetchone()[0]
+
+    if count >= max_calls:
+        # Find when the oldest entry expires
+        oldest = conn.execute(
+            "SELECT ts FROM rate_limits WHERE user_id=? AND action=? ORDER BY ts ASC LIMIT 1",
+            (user_id, action),
+        ).fetchone()
+        conn.close()
+        if oldest:
+            oldest_dt = datetime.datetime.strptime(oldest[0], "%Y-%m-%d %H:%M:%S")
+            wait = int((oldest_dt + datetime.timedelta(seconds=window_s) - now).total_seconds())
+            return False, max(wait, 1)
+        return False, window_s
+
+    # Record this call
+    conn.execute(
+        "INSERT INTO rate_limits (user_id, action, ts) VALUES (?,?,?)",
+        (user_id, action, now_str),
+    )
+    conn.commit()
+    conn.close()
+    return True, 0
+
+
+def _fmt_wait(seconds: int) -> str:
+    """Format wait seconds into a human-readable string (am/en mixed)."""
+    if seconds < 60:
+        return f"{seconds} ሰከንድ / {seconds}s"
+    elif seconds < 3600:
+        m = seconds // 60
+        return f"{m} ደቂቃ / {m} min"
+    else:
+        h = seconds // 3600
+        return f"{h} ሰዓት / {h} hr"
+
+
+# ── Input sanitization ────────────────────────────────────────────
+import re as _re
+
+_ALLOWED_PATTERN = _re.compile(
+    r"^[\u1200-\u137F\u0020-\u007Ea-zA-Z0-9 "
+    r"\u00C0-\u024F.,;:!?()\-\+/'\"@#\n]{1,500}$"
+)
+
+def sanitize_text(text: str) -> str | None:
+    """
+    Return the sanitized text, or None if it contains suspicious content.
+    Allows Amharic (Ethiopic), basic ASCII, and common punctuation.
+    Rejects SQL/script injection patterns and overly long strings.
+    """
+    text = text.strip()
+    if not text or len(text) > 500:
+        return None
+    # Block obvious SQL/script injection keywords
+    lowered = text.lower()
+    for bad in ("drop table", "select *", "insert into", "<script", "javascript:", "--", "/*"):
+        if bad in lowered:
+            return None
+    return text
+
+
+# ── Self-rating prevention ─────────────────────────────────────────
+# Map pharmacy index → Telegram user_id of the owner (set via env var)
+# Format: PHARMACY_OWNERS=0:123456789,1:987654321
+def _load_pharmacy_owners() -> dict[int, int]:
+    raw = os.environ.get("PHARMACY_OWNERS", "")
+    owners: dict[int, int] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if ":" in part:
+            try:
+                idx, uid = part.split(":", 1)
+                owners[int(idx)] = int(uid)
+            except ValueError:
+                pass
+    return owners
+
+PHARMACY_OWNERS: dict[int, int] = _load_pharmacy_owners()
+
+# Initialise DB on startup
+init_db()
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -300,11 +628,12 @@ async def _show_filtered_pharmacies(update: Update, context: ContextTypes.DEFAUL
         group = [e for e in all_entries if e["distance_km"] <= 1.0]
         title = "📍 *በዙሪያህ ያሉ ፋርማሲዎች* — 1 ኪ.ሜ ውስጥ\n_Pharmacies within 1km_"
     elif filter_key == "pharmacies_kebele":
-        group = [e for e in all_entries if 1.0 < e["distance_km"] <= 5.0]
+        group = [e for e in all_entries if e["distance_km"] <= 5.0]
         title = "🏘️ *በቀበሌው ያሉ ፋርማሲዎች* — 5 ኪ.ሜ ውስጥ\n_Pharmacies within 5km_"
     else:
-        group = [e for e in all_entries if e["distance_km"] > 5.0]
-        title = "🏙️ *በከተማው ያሉ ፋርማሲዎች*\n_All other city pharmacies_"
+        # City-wide — ሁሉም ፋርማሲዎች ይታያሉ
+        group = all_entries[:]
+        title = "🏙️ *በከተማው ያሉ ሁሉም ፋርማሲዎች*\n_All pharmacies in Bahir Dar_"
 
     # Sort: ዝቅተኛ (budget) → መካከለኛ (standard) → ከፍተኛ (premium), then by distance
     group.sort(key=lambda x: (TIER_ORDER.get(x.get("tier", ""), 9), x["distance_km"]))
@@ -543,6 +872,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data.pop("report_data", None)
         context.user_data.pop("rating_step", None)
         context.user_data.pop("rating_data", None)
+        context.user_data.pop("tax_step", None)
+        context.user_data.pop("tax_data", None)
         await query.edit_message_text(
             with_footer(t("welcome", lang)), parse_mode="Markdown",
             reply_markup=main_menu_keyboard(lang),
@@ -565,6 +896,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data.startswith("rate_pharm_"):
         idx = int(query.data.split("_")[-1])
         pharmacy_name = PHARMACIES[idx]["name"]
+
+        # ── Self-rating prevention ──────────────────────────────
+        user_id = update.effective_user.id
+        owner_id = PHARMACY_OWNERS.get(idx)
+        if owner_id and user_id == owner_id:
+            await query.answer("🚫 ራስዎ ለሚያስተዳድሩት ፋርማሲ ደረጃ መስጠት አይቻልም!", show_alert=True)
+            return
+
+        # ── Rate limit ──────────────────────────────────────────
+        allowed, wait = check_rate_limit(str(user_id), "rate_pharmacy")
+        if not allowed:
+            await query.answer(
+                f"⏳ ብዙ ጊዜ ሞክረዋል። {_fmt_wait(wait)} ቆይተው ይሞክሩ።",
+                show_alert=True,
+            )
+            return
+
         context.user_data["rating_data"]["pharmacy"] = pharmacy_name
         context.user_data["rating_data"]["pharmacy_idx"] = idx
         context.user_data["rating_step"] = "stars"
@@ -637,6 +985,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
     elif query.data == "qr_scan":
+        # ── Rate limit ──────────────────────────────────────────
+        allowed, wait = check_rate_limit(str(update.effective_user.id), "qr_scan")
+        if not allowed:
+            await query.answer(
+                f"⏳ QR scan ብዙ ጊዜ ሞክረዋል። {_fmt_wait(wait)} ቆይተው ይሞክሩ።",
+                show_alert=True,
+            )
+            return
         context.user_data["mode"] = "qr_scan"
         await query.edit_message_text(
             with_footer(t("qr_scan_prompt", lang)),
@@ -645,16 +1001,66 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
     elif query.data == "tax_report":
-        context.user_data["mode"] = None
+        context.user_data["mode"] = "tax_report"
+        context.user_data["tax_step"] = "pharmacy"
+        context.user_data["tax_data"] = {}
+        # Build pharmacy selector keyboard
+        rows, pair = [], []
+        for i, ph in enumerate(PHARMACIES):
+            pair.append(InlineKeyboardButton(ph["name"], callback_data=f"tax_pharm_{i}"))
+            if len(pair) == 2:
+                rows.append(pair); pair = []
+        if pair:
+            rows.append(pair)
+        rows.append([InlineKeyboardButton(t("btn_back", lang), callback_data="back_to_menu")])
         await query.edit_message_text(
             with_footer(
-                "🧾 *የቀረጥ ሪፖርት / Tax Report*\n\n"
-                "🚧 _ይህ ባህሪ በቅርቡ ይመጣል — Monthly tax report coming soon!_\n\n"
-                "ፋርማሲዎች ወርሃዊ ሪፖርት ያቀርባሉ።\n"
-                "_Pharmacies will submit monthly tax compliance reports._"
+                "🧾 *የወር ታክስ ሪፖርት / Monthly Tax Report*\n\n"
+                "ደረጃ 1/4 — የትኛውን ፋርማሲ ሪፖርት ያቀርባሉ?\n"
+                "_Step 1/4 — Which pharmacy are you reporting for?_"
             ),
             parse_mode="Markdown",
-            reply_markup=back_keyboard(lang),
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    elif query.data.startswith("tax_pharm_"):
+        idx = int(query.data.split("_")[-1])
+        pharmacy_name = PHARMACIES[idx]["name"]
+        context.user_data["tax_data"]["pharmacy"] = pharmacy_name
+        context.user_data["tax_step"] = "month"
+        # Offer last 3 months automatically
+        now = datetime.datetime.now()
+        months = [(now - datetime.timedelta(days=30 * i)).strftime("%Y-%m") for i in range(3)]
+        month_btns = [[InlineKeyboardButton(m, callback_data=f"tax_month_{m}")] for m in months]
+        month_btns.append([InlineKeyboardButton(t("btn_back", lang), callback_data="tax_report")])
+        await query.edit_message_text(
+            with_footer(
+                f"🧾 *የወር ታክስ ሪፖርት*\n\n"
+                f"🏥 _{pharmacy_name}_\n\n"
+                f"ደረጃ 2/4 — ምን ወር ሪፖርት ያቀርባሉ?\n"
+                f"_Step 2/4 — Select the reporting month:_"
+            ),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(month_btns),
+        )
+
+    elif query.data.startswith("tax_month_"):
+        month = query.data.replace("tax_month_", "")
+        context.user_data["tax_data"]["month"] = month
+        context.user_data["tax_step"] = "sales"
+        pharmacy_name = context.user_data["tax_data"].get("pharmacy", "")
+        await query.edit_message_text(
+            with_footer(
+                f"🧾 *የወር ታክስ ሪፖርት*\n\n"
+                f"🏥 _{pharmacy_name}_ · 📅 {month}\n\n"
+                f"ደረጃ 3/4 — ጠቅላላ ሽያጭ (ብር) ይጻፉ\n"
+                f"_Step 3/4 — Enter total sales amount in Birr:_\n\n"
+                f"ምሳሌ: `25000`"
+            ),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton(t("btn_back", lang), callback_data="tax_report")],
+            ]),
         )
 
 
@@ -682,24 +1088,121 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         processing_msg = await update.message.reply_text(
             "⏳ *QR እየተነበበ ነው...*\n_Reading QR code..._", parse_mode="Markdown"
         )
-        # +5 points for QR scan
-        total = add_points(context, 5)
-        level = get_level(total)
-        await processing_msg.delete()
-        await update.message.reply_text(
-            with_footer(
-                "✅ *QR ተሰርቷል! / QR Scanned!*\n\n"
-                "🧾 ደረሰኝዎ ተረጋግጧል!\n"
-                "_Your receipt has been verified!_\n\n"
-                f"🎁 *+5 Points ተጨምሮልዎታል!*\n"
-                f"📊 አጠቃላይ: *{total} pts* — {level}"
-            ),
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎁 የእኔ Points", callback_data="loyalty_points")],
-                [InlineKeyboardButton(t("btn_main_menu", lang), callback_data="back_to_menu")],
-            ]),
-        )
+        try:
+            photo      = update.message.photo[-1]
+            photo_file = await photo.get_file()
+            image_bytes = bytes(await photo_file.download_as_bytearray())
+
+            # ── Step 1: Real QR decode via OpenCV ─────────────────
+            qr_data = decode_qr_from_bytes(image_bytes)
+            await processing_msg.delete()
+
+            if not qr_data:
+                await update.message.reply_text(
+                    with_footer(
+                        "❌ *QR ኮድ አልተገኘም! / No QR Code Found!*\n\n"
+                        "📋 ፎቶው ላይ ትክክለኛ QR ኮድ የለም።\n"
+                        "_No valid QR code was detected in this photo._\n\n"
+                        "• ፎቶው ግልጽ እና ቀጥተኛ መሆን አለበት\n"
+                        "• QR ኮዱ ሙሉ በሙሉ መታየት አለበት\n"
+                        "_Make sure the QR is fully visible and in focus._"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 እንደገና ሞክር (Retry)", callback_data="qr_scan")],
+                        [InlineKeyboardButton(t("btn_main_menu", lang), callback_data="back_to_menu")],
+                    ]),
+                )
+                return
+
+            # ── Step 2: Duplicate check (image-level + QR-content) ─
+            img_hash = hash_image(image_bytes)
+            qr_hash  = hashlib.sha256(qr_data.encode()).hexdigest()
+
+            if is_duplicate_receipt(img_hash):
+                await update.message.reply_text(
+                    with_footer(
+                        "⚠️ *ደረሰኝ ቀደም ሲል ጥቅም ላይ ውሏል! / Receipt Already Used!*\n\n"
+                        "🚫 ይህ ደረሰኝ ቀደም ሲል ተቆርጦ points ተወስዷል።\n"
+                        "_This receipt has already been scanned and rewarded._\n\n"
+                        "እያንዳንዱ ደረሰኝ አንድ ጊዜ ብቻ ይሰራል።\n"
+                        "_Each receipt can only be used once._"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(t("btn_main_menu", lang), callback_data="back_to_menu")],
+                    ]),
+                )
+                return
+
+            if is_duplicate_receipt(qr_hash):
+                await update.message.reply_text(
+                    with_footer(
+                        "⚠️ *የዚህ QR ደረሰኝ ቀደም ሲል ጥቅም ላይ ውሏል! / QR Already Redeemed!*\n\n"
+                        "🚫 ይህ QR ኮድ ይዘት ቀደም ሲል ጥቅም ላይ ውሏል።\n"
+                        "_The content of this QR has already been used._\n\n"
+                        "ወደ ፋርማሲ ሄደው አዲስ ደረሰኝ ይጠይቁ።\n"
+                        "_Please get a new receipt from the pharmacy._"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton(t("btn_main_menu", lang), callback_data="back_to_menu")],
+                    ]),
+                )
+                return
+
+            # ── Step 3: Valid & new → save both hashes, award points ─
+            user    = update.effective_user
+            user_id = str(user.id)
+            save_receipt(img_hash, qr_data, user_id)
+            save_receipt(qr_hash,  qr_data, user_id)
+
+            # Audit log
+            log_path  = os.path.join(os.path.dirname(__file__), "qr_scans.log")
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            user_info = f"@{user.username}" if user.username else user_id
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(
+                    f"[{timestamp}] user={user_info} | "
+                    f"qr_data={qr_data[:80]} | img_hash={img_hash[:16]}...\n"
+                )
+
+            total = add_points(context, 5)
+            level = get_level(total)
+            await update.message.reply_text(
+                with_footer(
+                    "✅ *QR ተሰርቷል! / QR Verified!*\n\n"
+                    "🧾 ደረሰኝዎ ተረጋግጧል!\n"
+                    f"📋 QR: `{qr_data[:40]}{'...' if len(qr_data) > 40 else ''}`\n"
+                    "_Your receipt has been verified!_\n\n"
+                    f"🎁 *+5 Points ተጨምሮልዎታል!*\n"
+                    f"📊 አጠቃላይ: *{total} pts* — {level}"
+                ),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎁 የእኔ Points", callback_data="loyalty_points")],
+                    [InlineKeyboardButton(t("btn_main_menu", lang), callback_data="back_to_menu")],
+                ]),
+            )
+
+        except Exception as e:
+            logger.error(f"QR scan error: {e}")
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
+            await update.message.reply_text(
+                with_footer(
+                    "❌ *ስህተት ተፈጠረ / Error*\n\n"
+                    "QR ኮዱን ማንበብ አልተቻለም። እንደገና ይሞክሩ።\n"
+                    "_Could not process the image. Please try again._"
+                ),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 እንደገና ሞክር (Retry)", callback_data="qr_scan")],
+                    [InlineKeyboardButton(t("btn_main_menu", lang), callback_data="back_to_menu")],
+                ]),
+            )
         return
 
     if context.user_data.get("mode") != "prescription":
@@ -784,12 +1287,141 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _resolve_pending(update, context)
         return
 
+    if context.user_data.get("mode") == "tax_report":
+        step = context.user_data.get("tax_step")
+        data = context.user_data.setdefault("tax_data", {})
+
+        # Rate limit on tax_report submission (check once at sales step)
+        if step == "sales":
+            allowed, wait = check_rate_limit(str(update.effective_user.id), "tax_report")
+            if not allowed:
+                await update.message.reply_text(
+                    with_footer(
+                        f"⏳ *ብዙ ጊዜ ሞክረዋል / Too Many Reports*\n\n"
+                        f"{_fmt_wait(wait)} ቆይተው እንደገና ይሞክሩ።\n"
+                        f"_Please wait {_fmt_wait(wait)} before submitting again._"
+                    ),
+                    parse_mode="Markdown",
+                )
+                context.user_data["mode"] = None
+                context.user_data.pop("tax_step", None)
+                context.user_data.pop("tax_data", None)
+                return
+
+        if step == "sales":
+            try:
+                sales = float(text.replace(",", ""))
+                assert sales >= 0
+            except Exception:
+                await update.message.reply_text(
+                    with_footer(
+                        "⚠️ ትክክለኛ ቁጥር ያስገቡ (ምሳሌ: `25000`)\n"
+                        "_Please enter a valid number (e.g. 25000)_"
+                    ),
+                    parse_mode="Markdown",
+                )
+                return
+            data["sales"] = sales
+            context.user_data["tax_step"] = "units"
+            await update.message.reply_text(
+                with_footer(
+                    f"🧾 *የወር ታክስ ሪፖርት*\n\n"
+                    f"💰 ሽያጭ: *{sales:,.0f} ብር*\n\n"
+                    f"ደረጃ 4/4 — የተሸጠ ክምችት (units) ቁጥር ይጻፉ\n"
+                    f"_Step 4/4 — How many units were sold?_\n\n"
+                    f"ምሳሌ: `340`"
+                ),
+                parse_mode="Markdown",
+            )
+            return
+
+        if step == "units":
+            try:
+                units = int(text.replace(",", ""))
+                assert units >= 0
+            except Exception:
+                await update.message.reply_text(
+                    with_footer(
+                        "⚠️ ትክክለኛ ቁጥር ያስገቡ (ምሳሌ: `340`)\n"
+                        "_Please enter a valid whole number_"
+                    ),
+                    parse_mode="Markdown",
+                )
+                return
+
+            # ── Compute tax (15% VAT assumed) and save ────────────
+            pharmacy  = data.get("pharmacy", "—")
+            month     = data.get("month", "—")
+            sales     = data.get("sales", 0.0)
+            tax_paid  = round(sales * 0.15, 2)
+
+            report_id = save_tax_report(
+                pharmacy_name=pharmacy,
+                user_id=str(update.effective_user.id),
+                report_month=month,
+                total_sales=sales,
+                units_sold=units,
+                tax_paid=tax_paid,
+            )
+
+            # ── Auto reconciliation against EFDA stock ────────────
+            rec = reconcile_stock(pharmacy, month)
+            if rec["flag"]:
+                flag_tax_report(report_id)
+                recon_text = (
+                    f"\n\n⚠️ *ማጣጣሚያ ማስጠንቀቂያ / Reconciliation Warning!*\n"
+                    f"EFDA የሰጠው: *{rec['allocated']} units*\n"
+                    f"ሪፖርት የቀረበው: *{rec['reported']} units*\n"
+                    f"ልዩነት: *{rec['diff']:+d} units ({rec['pct']:+.1f}%)*\n"
+                    f"_ይህ ሪፖርት ለስልጣን አካሉ ለምርመራ ተልኳል።_\n"
+                    f"_This report has been flagged for review._"
+                )
+            elif rec["allocated"] > 0:
+                recon_text = (
+                    f"\n\n✅ *ማጣጣሚያ OK / Reconciliation OK*\n"
+                    f"EFDA የሰጠው: *{rec['allocated']} units*\n"
+                    f"ሪፖርት የቀረበው: *{rec['reported']} units*"
+                )
+            else:
+                recon_text = ""
+
+            context.user_data["mode"] = None
+            context.user_data.pop("tax_step", None)
+            context.user_data.pop("tax_data", None)
+
+            await update.message.reply_text(
+                with_footer(
+                    f"✅ *ሪፖርት ቀርቧል! / Report Submitted!*\n\n"
+                    f"🏥 *{pharmacy}*\n"
+                    f"📅 ወር: {month}\n"
+                    f"💰 ሽያጭ: *{sales:,.0f} ብር*\n"
+                    f"📦 የተሸጠ: *{units} units*\n"
+                    f"🧾 ታክስ (15% VAT): *{tax_paid:,.2f} ብር*"
+                    f"{recon_text}"
+                ),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(t("btn_main_menu", lang), callback_data="back_to_menu")],
+                ]),
+            )
+            return
+
     if context.user_data.get("mode") == "rating":
         step = context.user_data.get("rating_step")
-
         if step == "comment":
-            # User typed a comment (or /skip)
-            comment = "—" if text.lower() in ("/skip", "skip") else text
+            # Sanitize comment
+            safe = sanitize_text(text)
+            if safe is None:
+                await update.message.reply_text(
+                    with_footer(
+                        "⚠️ *ትክክለኛ ያልሆነ ጽሑፍ / Invalid Input*\n\n"
+                        "አስተያየቱ ተቀባይነት የለውም። ትክክለኛ ጽሑፍ ያስገቡ (500 ቁምፊ ወይም ያነሰ)።\n"
+                        "_Comment contains invalid characters. Please try again._"
+                    ),
+                    parse_mode="Markdown",
+                )
+                return
+            comment = "—" if safe.lower() in ("/skip", "skip") else safe
             await _save_rating(update, context, comment=comment)
             return
 
@@ -798,10 +1430,19 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         data = context.user_data.setdefault("report_data", {})
 
         if step == "medicine":
-            data["medicine"] = text
+            safe = sanitize_text(text)
+            if safe is None:
+                await update.message.reply_text(
+                    with_footer(
+                        "⚠️ *ትክክለኛ ያልሆነ ጽሑፍ*\n_Invalid medicine name. Please try again._"
+                    ),
+                    parse_mode="Markdown",
+                )
+                return
+            data["medicine"] = safe
             context.user_data["report_step"] = "price"
             await update.message.reply_text(
-                with_footer(t("report_step3", lang)) + f"\n\n💊 _{text}_",
+                with_footer(t("report_step3", lang)) + f"\n\n💊 _{safe}_",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton(t("btn_back", lang), callback_data="report_price")],
@@ -810,10 +1451,33 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             return
 
         if step == "price":
-            data["price"] = text
+            safe_price = sanitize_text(text)
+            if safe_price is None:
+                await update.message.reply_text(
+                    with_footer(
+                        "⚠️ *ትክክለኛ ያልሆነ ዋጋ*\n_Invalid price. Please enter a valid amount._"
+                    ),
+                    parse_mode="Markdown",
+                )
+                return
+
+            # Rate limit on price reports
+            allowed, wait = check_rate_limit(str(update.effective_user.id), "report_price")
+            if not allowed:
+                await update.message.reply_text(
+                    with_footer(
+                        f"⏳ *ብዙ ሪፖርቶች ቀርበዋል / Too Many Reports*\n\n"
+                        f"{_fmt_wait(wait)} ቆይተው ይሞክሩ።\n"
+                        f"_Wait {_fmt_wait(wait)} before reporting again._"
+                    ),
+                    parse_mode="Markdown",
+                )
+                return
+
+            data["price"] = safe_price
             pharmacy = data.get("pharmacy", "—")
             medicine = data.get("medicine", "—")
-            price = data.get("price", "—")
+            price    = data.get("price", "—")
 
             # Log the report
             log_path = os.path.join(os.path.dirname(__file__), "reports.log")
@@ -847,12 +1511,41 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if context.user_data.get("mode") == "search":
         context.user_data["mode"] = None
+
+        # Sanitize input
+        safe_q = sanitize_text(text)
+        if safe_q is None:
+            await update.message.reply_text(
+                with_footer(
+                    "⚠️ *ትክክለኛ ያልሆነ ጽሑፍ / Invalid Input*\n\n"
+                    "የፍለጋ ቃሉ ተቀባይነት የለውም።\n"
+                    "_Search query contains invalid characters._"
+                ),
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(lang),
+            )
+            return
+
+        # Rate limit
+        allowed, wait = check_rate_limit(str(update.effective_user.id), "search")
+        if not allowed:
+            await update.message.reply_text(
+                with_footer(
+                    f"⏳ *ብዙ ፍለጋ ሞክረዋል / Too Many Searches*\n\n"
+                    f"{_fmt_wait(wait)} ቆይተው ይሞክሩ።\n"
+                    f"_Wait {_fmt_wait(wait)} before searching again._"
+                ),
+                parse_mode="Markdown",
+                reply_markup=main_menu_keyboard(lang),
+            )
+            return
+
         searching_msg = await update.message.reply_text(
-            t("searching", lang, q=text), parse_mode="Markdown",
+            t("searching", lang, q=safe_q), parse_mode="Markdown",
         )
         try:
             lat, lon = get_user_location(context)
-            result_text = smart_medicine_search(text, lat, lon)
+            result_text = smart_medicine_search(safe_q, lat, lon)
             await searching_msg.delete()
             await update.message.reply_text(
                 with_footer(result_text), parse_mode="Markdown",
@@ -868,14 +1561,117 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 with_footer(t("search_error", lang)), parse_mode="Markdown",
                 reply_markup=main_menu_keyboard(lang),
             )
-    else:
+        return
+
+    # Fallback for unrecognised input
+    await update.message.reply_text(
+        with_footer(t("fallback", lang)), parse_mode="Markdown",
+        reply_markup=main_menu_keyboard(lang),
+    )
+
+
+ADMIN_IDS_ENV = os.environ.get("ADMIN_TELEGRAM_IDS", "")
+ADMIN_IDS: set[int] = {
+    int(x.strip()) for x in ADMIN_IDS_ENV.split(",") if x.strip().isdigit()
+}
+
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /admin — summary dashboard for ንግድ ቢሮ / EFDA officers.
+    Access is restricted to user IDs listed in the ADMIN_TELEGRAM_IDS env var.
+    """
+    user = update.effective_user
+    if ADMIN_IDS and user.id not in ADMIN_IDS:
         await update.message.reply_text(
-            with_footer(t("fallback", lang)), parse_mode="Markdown",
-            reply_markup=main_menu_keyboard(lang),
+            "🚫 *ፈቃድ የለዎትም / Access Denied*\n"
+            "_This command is for authorised officers only._",
+            parse_mode="Markdown",
         )
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+
+    # ── 1. Total receipts scanned ─────────────────────────────────
+    total_receipts = conn.execute(
+        "SELECT COUNT(DISTINCT qr_data) FROM scanned_receipts"
+    ).fetchone()[0]
+
+    # ── 2. Tax reports summary ────────────────────────────────────
+    tr = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(total_sales_birr),0), "
+        "       COALESCE(SUM(tax_paid_birr),0), "
+        "       SUM(CASE WHEN status='flagged' THEN 1 ELSE 0 END) "
+        "FROM tax_reports"
+    ).fetchone()
+    rpt_count, total_sales, total_tax, flagged = tr
+
+    # ── 3. Flagged reports detail (last 5) ────────────────────────
+    flagged_rows = conn.execute(
+        "SELECT pharmacy_name, report_month, units_sold, total_sales_birr "
+        "FROM tax_reports WHERE status='flagged' ORDER BY submitted_at DESC LIMIT 5"
+    ).fetchall()
+
+    # ── 4. Top pharmacies by sales ────────────────────────────────
+    top_ph = conn.execute(
+        "SELECT pharmacy_name, SUM(total_sales_birr) as s "
+        "FROM tax_reports GROUP BY pharmacy_name ORDER BY s DESC LIMIT 5"
+    ).fetchall()
+
+    # ── 5. QR scans per user (top 5, potential abusers) ──────────
+    top_users = conn.execute(
+        "SELECT user_id, COUNT(*) as c FROM scanned_receipts "
+        "GROUP BY user_id ORDER BY c DESC LIMIT 5"
+    ).fetchall()
+
+    conn.close()
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [
+        f"🛡️ *Admin Dashboard — {now}*",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        f"📷 *ደረሰኝ Scans (ጠቅላላ):* {total_receipts}",
+        "",
+        "🧾 *ታክስ ሪፖርቶች*",
+        f"   📋 ጠቅላላ ሪፖርቶች: {rpt_count}",
+        f"   💰 ጠቅላላ ሽያጭ: {total_sales:,.0f} ብር",
+        f"   🏦 ጠቅላላ ታክስ: {total_tax:,.2f} ብር",
+        f"   🚩 ምልክት የተደረገ: {flagged}",
+    ]
+
+    if flagged_rows:
+        lines += ["", "🚩 *የተጠረጠሩ ሪፖርቶች (Flagged)*"]
+        for r in flagged_rows:
+            lines.append(f"   • {r[0]} | {r[1]} | {r[2]} units | {r[3]:,.0f} ብር")
+
+    if top_ph:
+        lines += ["", "🏆 *ከፍተኛ ሽያጭ ፋርማሲዎች*"]
+        for i, (ph, s) in enumerate(top_ph, 1):
+            lines.append(f"   {i}. {ph}: {s:,.0f} ብር")
+
+    if top_users:
+        lines += ["", "👤 *ከፍተኛ QR ስካን ተጠቃሚዎች*"]
+        for uid, c in top_users:
+            lines.append(f"   • user {uid}: {c} scans")
+
+    lines += ["", "━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]
+
+    await update.message.reply_text(
+        with_footer("\n".join(lines)),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 አዘምን (Refresh)", callback_data="admin_refresh")],
+            [InlineKeyboardButton(t("btn_main_menu", get_lang(context)), callback_data="back_to_menu")],
+        ]),
+    )
 
 
-# ── entry point ───────────────────────────────────────────────────
+async def admin_refresh_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline button refresh — re-runs admin_command logic."""
+    query = update.callback_query
+    await query.answer("🔄 እያዘመነ ነው...")
+    await admin_command(update, context)
 
 async def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -889,6 +1685,8 @@ async def main() -> None:
     app.add_handler(CommandHandler("summary", summary_command))
     app.add_handler(CommandHandler("language", language_command))
     app.add_handler(CommandHandler("report", report_command))
+    app.add_handler(CommandHandler("admin", admin_command))
+    app.add_handler(CallbackQueryHandler(admin_refresh_handler, pattern="^admin_refresh$"))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.LOCATION, location_handler))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
