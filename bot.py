@@ -4,9 +4,14 @@ import datetime
 import threading
 import hashlib
 import sqlite3
+import secrets
 import numpy as np
 import cv2
-from http.server import HTTPServer, BaseHTTPRequestHandler
+import uvicorn
+from fastapi import FastAPI, HTTPException, Depends, Header, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 # ── SQLite DB for receipt tracking ───────────────────────────────
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "receipts.db")
@@ -63,6 +68,28 @@ def init_db():
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_rl ON rate_limits(user_id, action, ts)")
+
+    # ── App users (Android login) ─────────────────────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_users (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            phone        TEXT UNIQUE NOT NULL,
+            name         TEXT NOT NULL,
+            role         TEXT DEFAULT 'user',   -- user / pharmacy / admin
+            pharmacy_idx INTEGER DEFAULT -1,    -- which pharmacy they manage (-1 = none)
+            created_at   TEXT NOT NULL
+        )
+    """)
+
+    # ── API tokens (issued on login) ──────────────────────────────
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS api_tokens (
+            token       TEXT PRIMARY KEY,
+            user_id     INTEGER NOT NULL,
+            created_at  TEXT NOT NULL,
+            expires_at  TEXT NOT NULL
+        )
+    """)
 
     conn.commit()
     conn.close()
@@ -332,18 +359,428 @@ PHARMACY_OWNERS: dict[int, int] = _load_pharmacy_owners()
 # Initialise DB on startup
 init_db()
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, format, *args):
-        pass
+# ══════════════════════════════════════════════════════════════════
+# FastAPI — REST API for Android App
+# ══════════════════════════════════════════════════════════════════
 
-def run_health_server():
+api = FastAPI(title="Pharmacy Bot API", version="1.0.0")
+
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Pydantic request/response models ─────────────────────────────
+
+class RegisterRequest(BaseModel):
+    phone: str
+    name: str
+    role: str = "user"          # user / pharmacy / admin
+    pharmacy_idx: int = -1
+
+class LoginRequest(BaseModel):
+    phone: str
+
+class PriceReportRequest(BaseModel):
+    pharmacy: str
+    medicine: str
+    price: str
+
+class RatingRequest(BaseModel):
+    pharmacy_idx: int
+    stars: int                  # 1-5
+    comment: str = "—"
+
+class TaxReportRequest(BaseModel):
+    pharmacy_name: str
+    report_month: str           # e.g. "2024-06"
+    total_sales_birr: float
+    units_sold: int
+
+class EfdaStockRequest(BaseModel):
+    pharmacy_name: str
+    medicine_name: str
+    units_allocated: int
+    allocated_month: str
+
+
+# ── Auth helpers ──────────────────────────────────────────────────
+
+def _issue_token(user_id: int) -> str:
+    """Create and store a 30-day API token for a user."""
+    token     = secrets.token_hex(32)
+    now       = datetime.datetime.now()
+    expires   = (now + datetime.timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+    now_str   = now.strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO api_tokens (token, user_id, created_at, expires_at) VALUES (?,?,?,?)",
+        (token, user_id, now_str, expires),
+    )
+    conn.commit()
+    conn.close()
+    return token
+
+
+def _get_current_user(authorization: str = Header(None)) -> dict:
+    """Dependency: validate Bearer token and return user row."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Token አልተሰጠም / Missing token")
+    token = authorization.split(" ", 1)[1]
+    now   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn  = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        """SELECT u.* FROM api_tokens t
+           JOIN app_users u ON u.id = t.user_id
+           WHERE t.token=? AND t.expires_at > ?""",
+        (token, now),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=401, detail="Token ጊዜው አልፏል ወይም ትክክለኛ አይደለም")
+    return dict(row)
+
+
+def _require_admin(user: dict = Depends(_get_current_user)) -> dict:
+    if user["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Admin ብቻ ይህን ሊጠቀም ይችላል")
+    return user
+
+
+# ══════════════════════════════════════════════════════════════════
+# PUBLIC ENDPOINTS (no auth needed)
+# ══════════════════════════════════════════════════════════════════
+
+@api.get("/health")
+def health():
+    """Render health check."""
+    return {"status": "ok"}
+
+
+@api.post("/auth/register")
+def register(req: RegisterRequest):
+    """Register a new app user and return a token."""
+    safe_phone = sanitize_text(req.phone)
+    safe_name  = sanitize_text(req.name)
+    if not safe_phone or not safe_name:
+        raise HTTPException(status_code=400, detail="ትክክለኛ ያልሆነ ግብዓት / Invalid input")
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        cur = conn.execute(
+            "INSERT INTO app_users (phone, name, role, pharmacy_idx, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (safe_phone, safe_name, req.role, req.pharmacy_idx, now),
+        )
+        user_id = cur.lastrowid
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # Phone already registered — just log in
+        row = conn.execute(
+            "SELECT id FROM app_users WHERE phone=?", (safe_phone,)
+        ).fetchone()
+        user_id = row[0]
+    finally:
+        conn.close()
+
+    token = _issue_token(user_id)
+    return {"token": token, "user_id": user_id, "message": "ተመዝግበዋል! / Registered!"}
+
+
+@api.post("/auth/login")
+def login(req: LoginRequest):
+    """Log in by phone number and return a fresh token."""
+    safe_phone = sanitize_text(req.phone)
+    if not safe_phone:
+        raise HTTPException(status_code=400, detail="ትክክለኛ ያልሆነ ስልክ ቁጥር")
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute(
+        "SELECT * FROM app_users WHERE phone=?", (safe_phone,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="ተጠቃሚ አልተገኘም / User not found")
+    token = _issue_token(row["id"])
+    return {
+        "token":    token,
+        "user_id":  row["id"],
+        "name":     row["name"],
+        "role":     row["role"],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════
+# PROTECTED ENDPOINTS (Bearer token required)
+# ══════════════════════════════════════════════════════════════════
+
+# ── Pharmacies ────────────────────────────────────────────────────
+
+@api.get("/pharmacies")
+def get_pharmacies(
+    lat: float = 0.0,
+    lon: float = 0.0,
+    user: dict = Depends(_get_current_user),
+):
+    """Return all pharmacies with distance from user location."""
+    from pharmacies import PHARMACIES, haversine_km, TIER_LABELS
+    result = []
+    for i, p in enumerate(PHARMACIES):
+        dist = round(haversine_km(lat or p["lat"], lon or p["lon"], p["lat"], p["lon"]), 2)
+        result.append({
+            "idx":      i,
+            "name":     p["name"],
+            "address":  p["address"],
+            "phone":    p["phone"],
+            "hours":    p["hours"],
+            "tier":     p.get("tier", ""),
+            "tier_label": TIER_LABELS.get(p.get("tier", ""), ""),
+            "lat":      p["lat"],
+            "lon":      p["lon"],
+            "distance_km": dist,
+        })
+    result.sort(key=lambda x: x["distance_km"])
+    return {"pharmacies": result}
+
+
+# ── Price summary ─────────────────────────────────────────────────
+
+@api.get("/prices/summary")
+def price_summary(user: dict = Depends(_get_current_user)):
+    """Return the latest price summary text."""
+    from pharmacies import format_price_summary
+    return {"summary": format_price_summary()}
+
+
+# ── Price reports ─────────────────────────────────────────────────
+
+@api.post("/prices/report")
+def report_price(
+    req: PriceReportRequest,
+    user: dict = Depends(_get_current_user),
+):
+    """Submit a medicine price report."""
+    safe_med   = sanitize_text(req.medicine)
+    safe_price = sanitize_text(req.price)
+    safe_ph    = sanitize_text(req.pharmacy)
+    if not all([safe_med, safe_price, safe_ph]):
+        raise HTTPException(status_code=400, detail="ትክክለኛ ያልሆነ ግብዓት")
+
+    # Rate limit
+    allowed, wait = check_rate_limit(str(user["id"]), "report_price")
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"ብዙ ሪፖርቶች ቀርበዋል። {_fmt_wait(wait)} ቆይተው ይሞክሩ።",
+        )
+
+    log_path  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reports.log")
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(
+            f"[{timestamp}] user={user['id']} | pharmacy={safe_ph} "
+            f"| medicine={safe_med} | price={safe_price} ብር\n"
+        )
+    return {"ok": True, "points_earned": 20, "message": "ሪፖርት ቀርቧል! / Report submitted!"}
+
+
+# ── Ratings ───────────────────────────────────────────────────────
+
+@api.get("/ratings")
+def get_ratings(user: dict = Depends(_get_current_user)):
+    """Return aggregated star ratings per pharmacy."""
+    import collections
+    log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ratings.log")
+    totals: dict = collections.defaultdict(list)
+    if os.path.exists(log_path):
+        with open(log_path, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    parts = {
+                        p.split("=", 1)[0].strip(): p.split("=", 1)[1].strip()
+                        for p in line.split("|")
+                    }
+                    ph    = parts.get("pharmacy", "").strip()
+                    stars = int(parts.get("stars", "0").strip())
+                    if ph and stars:
+                        totals[ph].append(stars)
+                except Exception:
+                    continue
+    result = []
+    for ph, stars_list in totals.items():
+        avg = sum(stars_list) / len(stars_list)
+        result.append({
+            "pharmacy": ph,
+            "avg_stars": round(avg, 1),
+            "total_reviews": len(stars_list),
+        })
+    result.sort(key=lambda x: -x["avg_stars"])
+    return {"ratings": result}
+
+
+@api.post("/ratings")
+def submit_rating(
+    req: RatingRequest,
+    user: dict = Depends(_get_current_user),
+):
+    """Submit a star rating for a pharmacy."""
+    if not 1 <= req.stars <= 5:
+        raise HTTPException(status_code=400, detail="ኮከብ 1–5 ብቻ ሊሆን ይችላል")
+
+    from pharmacies import PHARMACIES
+    if req.pharmacy_idx < 0 or req.pharmacy_idx >= len(PHARMACIES):
+        raise HTTPException(status_code=400, detail="ፋርማሲ አልተገኘም")
+
+    pharmacy_name = PHARMACIES[req.pharmacy_idx]["name"]
+
+    # Self-rating check
+    owner_id = PHARMACY_OWNERS.get(req.pharmacy_idx)
+    if owner_id and user["id"] == owner_id:
+        raise HTTPException(status_code=403, detail="ለራስዎ ፋርማሲ ደረጃ መስጠት አይቻልም")
+
+    # Rate limit
+    allowed, wait = check_rate_limit(str(user["id"]), "rate_pharmacy")
+    if not allowed:
+        raise HTTPException(status_code=429, detail=f"{_fmt_wait(wait)} ቆይተው ይሞክሩ።")
+
+    safe_comment = sanitize_text(req.comment) or "—"
+    log_path  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ratings.log")
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(
+            f"[{timestamp}] user={user['id']} | pharmacy={pharmacy_name} "
+            f"| stars={req.stars} | comment={safe_comment}\n"
+        )
+    return {"ok": True, "points_earned": 10, "message": "ደረጃ ቀርቧል! / Rating submitted!"}
+
+
+# ── QR scan (mobile camera) ───────────────────────────────────────
+
+@api.post("/qr/scan")
+async def qr_scan(
+    file: UploadFile = File(...),
+    user: dict = Depends(_get_current_user),
+):
+    """Upload a receipt photo; returns QR data and awards points if valid."""
+    allowed, wait = check_rate_limit(str(user["id"]), "qr_scan")
+    if not allowed:
+        raise HTTPException(status_code=429, detail=f"{_fmt_wait(wait)} ቆይተው ይሞክሩ።")
+
+    image_bytes = await file.read()
+    qr_data = decode_qr_from_bytes(image_bytes)
+    if not qr_data:
+        raise HTTPException(status_code=422, detail="QR ኮድ አልተገኘም / No QR code found")
+
+    img_hash = hash_image(image_bytes)
+    qr_hash  = hashlib.sha256(qr_data.encode()).hexdigest()
+
+    if is_duplicate_receipt(img_hash) or is_duplicate_receipt(qr_hash):
+        raise HTTPException(status_code=409, detail="ደረሰኝ ቀደም ሲል ጥቅም ላይ ውሏል / Already used")
+
+    save_receipt(img_hash, qr_data, str(user["id"]))
+    save_receipt(qr_hash,  qr_data, str(user["id"]))
+    return {"ok": True, "qr_data": qr_data, "points_earned": 5}
+
+
+# ── Tax reports ───────────────────────────────────────────────────
+
+@api.post("/tax/report")
+def submit_tax_report(
+    req: TaxReportRequest,
+    user: dict = Depends(_get_current_user),
+):
+    """Pharmacy submits monthly tax report."""
+    allowed, wait = check_rate_limit(str(user["id"]), "tax_report")
+    if not allowed:
+        raise HTTPException(status_code=429, detail=f"{_fmt_wait(wait)} ቆይተው ይሞክሩ።")
+
+    tax_paid  = round(req.total_sales_birr * 0.15, 2)
+    report_id = save_tax_report(
+        pharmacy_name=req.pharmacy_name,
+        user_id=str(user["id"]),
+        report_month=req.report_month,
+        total_sales=req.total_sales_birr,
+        units_sold=req.units_sold,
+        tax_paid=tax_paid,
+    )
+    rec = reconcile_stock(req.pharmacy_name, req.report_month)
+    if rec["flag"]:
+        flag_tax_report(report_id)
+
+    return {
+        "ok":        True,
+        "report_id": report_id,
+        "tax_paid":  tax_paid,
+        "flagged":   rec["flag"],
+        "reconciliation": rec,
+    }
+
+
+# ── Admin dashboard ───────────────────────────────────────────────
+
+@api.get("/admin/dashboard")
+def admin_dashboard(admin: dict = Depends(_require_admin)):
+    """Full stats dashboard — admin only."""
+    conn = sqlite3.connect(DB_PATH)
+    total_receipts = conn.execute(
+        "SELECT COUNT(DISTINCT qr_data) FROM scanned_receipts"
+    ).fetchone()[0]
+    tr = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(total_sales_birr),0), "
+        "COALESCE(SUM(tax_paid_birr),0), "
+        "SUM(CASE WHEN status='flagged' THEN 1 ELSE 0 END) FROM tax_reports"
+    ).fetchone()
+    flagged_rows = conn.execute(
+        "SELECT pharmacy_name, report_month, units_sold, total_sales_birr "
+        "FROM tax_reports WHERE status='flagged' ORDER BY submitted_at DESC LIMIT 10"
+    ).fetchall()
+    top_ph = conn.execute(
+        "SELECT pharmacy_name, SUM(total_sales_birr) FROM tax_reports "
+        "GROUP BY pharmacy_name ORDER BY 2 DESC LIMIT 5"
+    ).fetchall()
+    conn.close()
+    return {
+        "total_receipts_scanned": total_receipts,
+        "tax_reports": {
+            "count":       tr[0],
+            "total_sales": tr[1],
+            "total_tax":   tr[2],
+            "flagged":     tr[3],
+        },
+        "flagged_reports": [
+            {"pharmacy": r[0], "month": r[1], "units": r[2], "sales": r[3]}
+            for r in flagged_rows
+        ],
+        "top_pharmacies_by_sales": [
+            {"pharmacy": r[0], "total_sales": r[1]} for r in top_ph
+        ],
+    }
+
+
+@api.post("/admin/efda_stock")
+def add_stock(
+    req: EfdaStockRequest,
+    admin: dict = Depends(_require_admin),
+):
+    """Admin records EFDA stock allocation for a pharmacy."""
+    add_efda_stock(
+        req.pharmacy_name,
+        req.medicine_name,
+        req.units_allocated,
+        req.allocated_month,
+    )
+    return {"ok": True, "message": "ክምችት ተመዝግቧል / Stock recorded"}
+
+
+# ── FastAPI runner (in background thread) ─────────────────────────
+
+def run_api_server():
     port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    server.serve_forever()
+    uvicorn.run(api, host="0.0.0.0", port=port, log_level="warning")
 
 from telegram import (
     Update,
@@ -1696,7 +2133,7 @@ async def main() -> None:
     async with app:
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-        threading.Thread(target=run_health_server, daemon=True).start()
+        threading.Thread(target=run_api_server, daemon=True).start()
         # Run forever
         await asyncio.Event().wait()
         await app.updater.stop()

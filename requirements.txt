@@ -7,3 +7,8 @@ numpy>=1.24.0
 
 # Google Gemini Vision API
 google-generativeai>=0.8.0
+
+# REST API server for Android App
+fastapi>=0.110.0
+uvicorn>=0.29.0
+python-multipart>=0.0.9
