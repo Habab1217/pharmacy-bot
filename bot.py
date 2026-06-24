@@ -454,10 +454,19 @@ def _require_admin(user: dict = Depends(_get_current_user)) -> dict:
 # PUBLIC ENDPOINTS (no auth needed)
 # ══════════════════════════════════════════════════════════════════
 
+@api.get("/")
+@api.head("/")
+def root():
+    """Root endpoint — UptimeRobot root ping."""
+    import time as _t
+    return {"status": "ok", "service": "MedLink Ethiopia Bot", "timestamp": int(_t.time())}
+
 @api.get("/health")
+@api.head("/health")
 def health():
     """Render health check."""
-    return {"status": "ok"}
+    import time as _t
+    return {"status": "ok", "service": "MedLink Ethiopia Bot", "timestamp": int(_t.time())}
 
 
 @api.post("/auth/register")
@@ -781,6 +790,20 @@ def add_stock(
 def run_api_server():
     port = int(os.environ.get("PORT", 10000))
     uvicorn.run(api, host="0.0.0.0", port=port, log_level="warning")
+
+def run_self_ping():
+    """ቦቱ ራሱን ይ-ping ያደርጋል — Render free tier sleep እንዳይተኛ"""
+    import urllib.request, time as _t
+    port = int(os.environ.get("PORT", 10000))
+    url = f"http://localhost:{port}/health"
+    _t.sleep(40)  # API server startup ይጠብቅ
+    while True:
+        try:
+            _t.sleep(8 * 60)  # ከ8 ደቂቃ አንዴ
+            urllib.request.urlopen(url, timeout=10)
+            logger.info("Self-ping OK")
+        except Exception as e:
+            logger.warning(f"Self-ping failed: {e}")
 
 from telegram import (
     Update,
@@ -2134,6 +2157,7 @@ async def main() -> None:
         await app.start()
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
         threading.Thread(target=run_api_server, daemon=True).start()
+        threading.Thread(target=run_self_ping, daemon=True).start()
         # Run forever
         await asyncio.Event().wait()
         await app.updater.stop()
